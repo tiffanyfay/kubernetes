@@ -156,10 +156,9 @@ func TestChinaECRProvide(t *testing.T) {
 	repoToPull := path.Join(registry, image)
 	p := newECRProvider(registryURLTemplateChina,
 		&testTokenGetter{
-			user:              user,
-			password:          password,
-			endpoint:          registry,
-			randomizePassword: true,
+			user:     user,
+			password: password,
+			endpoint: registry,
 		})
 	keyring := &credentialprovider.BasicDockerKeyring{}
 	keyring.Add(p.Provide(repoToPull))
@@ -204,9 +203,10 @@ func TestChinaECRProvideCached(t *testing.T) {
 
 	p := newECRProvider(registryURLTemplateChina,
 		&testTokenGetter{
-			user:     user,
-			password: password,
-			endpoint: registry,
+			user:              user,
+			password:          password,
+			endpoint:          registry,
+			randomizePassword: true,
 		})
 
 	repoToPull := path.Join(registry, image)
