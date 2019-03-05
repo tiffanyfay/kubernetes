@@ -79,12 +79,12 @@ func (p *rancherProvider) Enabled() bool {
 }
 
 // LazyProvide implements DockerConfigProvider. Should never be called.
-func (p *rancherProvider) LazyProvide() *credentialprovider.DockerConfigEntry {
+func (p *rancherProvider) LazyProvide(repoToPull string) *credentialprovider.DockerConfigEntry {
 	return nil
 }
 
 // Provide implements DockerConfigProvider.Provide, refreshing Rancher tokens on demand
-func (p *rancherProvider) Provide() credentialprovider.DockerConfig {
+func (p *rancherProvider) Provide(repoToPull string) credentialprovider.DockerConfig {
 	cfg := credentialprovider.DockerConfig{}
 	for _, cred := range p.credGetter.getCredentials() {
 		entry := credentialprovider.DockerConfigEntry{

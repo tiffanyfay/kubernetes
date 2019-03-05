@@ -17,7 +17,7 @@ limitations under the License.
 package kuberuntime
 
 import (
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/credentialprovider"
@@ -57,7 +57,7 @@ func (m *kubeGenericRuntimeManager) PullImage(image kubecontainer.ImageSpec, pul
 
 	var pullErrs []error
 	for _, currentCreds := range creds {
-		authConfig := credentialprovider.LazyProvide(currentCreds)
+		authConfig := credentialprovider.LazyProvide(currentCreds, repoToPull)
 		auth := &runtimeapi.AuthConfig{
 			Username:      authConfig.Username,
 			Password:      authConfig.Password,

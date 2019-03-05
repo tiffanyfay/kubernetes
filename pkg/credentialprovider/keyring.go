@@ -75,7 +75,7 @@ type AuthConfig struct {
 
 // LazyAuthConfiguration wraps dockertypes.AuthConfig, potentially deferring its
 // binding. If Provider is non-nil, it will be used to obtain new credentials
-// by calling LazyProvide() on it.
+// by calling LazyProvide(repoToPull) on it.
 type LazyAuthConfiguration struct {
 	AuthConfig
 	Provider DockerConfigProvider
@@ -181,8 +181,8 @@ func isDefaultRegistryMatch(image string) bool {
 
 // url.Parse require a scheme, but ours don't have schemes.  Adding a
 // scheme to make url.Parse happy, then clear out the resulting scheme.
-func parseSchemelessUrl(schemelessUrl string) (*url.URL, error) {
-	parsed, err := url.Parse("https://" + schemelessUrl)
+func parseSchemelessURL(schemelessURL string) (*url.URL, error) {
+	parsed, err := url.Parse("https://" + schemelessURL)
 	if err != nil {
 		return nil, err
 	}
@@ -191,8 +191,8 @@ func parseSchemelessUrl(schemelessUrl string) (*url.URL, error) {
 	return parsed, nil
 }
 
-// split the host name into parts, as well as the port
-func splitUrl(url *url.URL) (parts []string, port string) {
+// splitURL splits the host name into parts, as well as the port
+func splitURL(url *url.URL) (parts []string, port string) {
 	host, port, err := net.SplitHostPort(url.Host)
 	if err != nil {
 		// could not parse port
@@ -201,45 +201,48 @@ func splitUrl(url *url.URL) (parts []string, port string) {
 	return strings.Split(host, "."), port
 }
 
-// overloaded version of urlsMatch, operating on strings instead of URLs.
+// urlsMatchStr is an overloaded version of urlsMatch, operating on strings instead of URLs.
 func urlsMatchStr(glob string, target string) (bool, error) {
-	globUrl, err := parseSchemelessUrl(glob)
+	globURL, err := parseSchemelessURL(glob)
 	if err != nil {
 		return false, err
 	}
-	targetUrl, err := parseSchemelessUrl(target)
+	targetURL, err := parseSchemelessURL(target)
 	if err != nil {
 		return false, err
 	}
-	return urlsMatch(globUrl, targetUrl)
+	return urlsMatch(globURL, targetURL)
 }
 
 // check whether the given target url matches the glob url, which may have
 // glob wild cards in the host name.
 //
 // Examples:
-//    globUrl=*.docker.io, targetUrl=blah.docker.io => match
-//    globUrl=*.docker.io, targetUrl=not.right.io   => no match
+//    globURL=*.docker.io, targetURL=blah.docker.io => match
+//    globURL=*.docker.io, targetURL=not.right.io   => no match
 //
 // Note that we don't support wildcards in ports and paths yet.
-func urlsMatch(globUrl *url.URL, targetUrl *url.URL) (bool, error) {
-	globUrlParts, globPort := splitUrl(globUrl)
-	targetUrlParts, targetPort := splitUrl(targetUrl)
+
+// *.dkr.ecr.*.amazonaws.com, 123.dkr.ecr.us-west-2.amazonaws.com
+// *.dkr.ecr.*.amazonaws.com.cn, 123.dkr.ecr.us-west-2.amazonaws.com.cn -> last blob would be com.cn
+func urlsMatch(globURL *url.URL, targetURL *url.URL) (bool, error) {
+	globURLParts, globPort := splitURL(globURL)
+	targetURLParts, targetPort := splitURL(targetURL)
 	if globPort != targetPort {
 		// port doesn't match
 		return false, nil
 	}
-	if len(globUrlParts) != len(targetUrlParts) {
+	if len(globURLParts) != len(targetURLParts) {
 		// host name does not have the same number of parts
 		return false, nil
 	}
-	if !strings.HasPrefix(targetUrl.Path, globUrl.Path) {
+	if !strings.HasPrefix(targetURL.Path, globURL.Path) {
 		// the path of the credential must be a prefix
 		return false, nil
 	}
-	for k, globUrlPart := range globUrlParts {
-		targetUrlPart := targetUrlParts[k]
-		matched, err := filepath.Match(globUrlPart, targetUrlPart)
+	for k, globURLPart := range globURLParts {
+		targetURLPart := targetURLParts[k]
+		matched, err := filepath.Match(globURLPart, targetURLPart)
 		if err != nil {
 			return false, err
 		}
@@ -261,11 +264,9 @@ func (dk *BasicDockerKeyring) Lookup(image string) ([]LazyAuthConfiguration, boo
 	for _, k := range dk.index {
 		// both k and image are schemeless URLs because even though schemes are allowed
 		// in the credential configurations, we remove them in Add.
-		if matched, _ := urlsMatchStr(k, image); !matched {
-			continue
+		if matched, _ := urlsMatchStr(k, image); matched {
+			ret = append(ret, dk.creds[k]...)
 		}
-
-		ret = append(ret, dk.creds[k]...)
 	}
 
 	if len(ret) > 0 {
@@ -288,7 +289,7 @@ func (dk *lazyDockerKeyring) Lookup(image string) ([]LazyAuthConfiguration, bool
 	keyring := &BasicDockerKeyring{}
 
 	for _, p := range dk.Providers {
-		keyring.Add(p.Provide())
+		keyring.Add(p.Provide(image))
 	}
 
 	return keyring.Lookup(image)

@@ -18,7 +18,8 @@ package credentials
 
 import (
 	"encoding/base64"
-	"fmt"
+	"errors"
+	"net/url"
 	"strings"
 	"time"
 
@@ -28,13 +29,13 @@ import (
 	"github.com/aws/aws-sdk-go/service/ecr"
 	"k8s.io/klog"
 
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/kubernetes/pkg/credentialprovider"
+	"k8s.io/kubernetes/pkg/version"
 )
 
-const awsChinaRegionPrefix = "cn-"
-const awsStandardDNSSuffix = "amazonaws.com"
-const awsChinaDNSSuffix = "amazonaws.com.cn"
-const registryURLTemplate = "*.dkr.ecr.%s.%s"
+const registryURLTemplateStandard = "*.dkr.ecr.*.amazonaws.com"
+const registryURLTemplateChina = "*.dkr.ecr.*.amazonaws.com.cn"
 
 // awsHandlerLogger is a handler that logs all AWS SDK requests
 // Copied from pkg/cloudprovider/providers/aws/log_handler.go
@@ -50,6 +51,43 @@ func awsHandlerLogger(req *request.Request) {
 	klog.V(3).Infof("AWS request: %s:%s in %s", service, name, *region)
 }
 
+/*PARSE*/
+type parsedURL struct {
+	registryID string
+	region     string
+	host       string
+}
+
+// url.Parse require a scheme, but ours don't have schemes.  Adding a
+// scheme to make url.Parse happy, then clear out the resulting scheme.
+func parseSchemelessURL(schemelessURL string) (*url.URL, error) {
+	parsed, err := url.Parse("https://" + schemelessURL)
+	if err != nil {
+		return nil, err
+	}
+	// clear out the resulting scheme
+	parsed.Scheme = ""
+	return parsed, nil
+}
+
+func splitSchemelessURL(repoToPull string) (*parsedURL, error) {
+	parsed, err := parseSchemelessURL(repoToPull)
+	if err != nil {
+		klog.Errorf("unable to parse registry URL %v", err)
+		return nil, err
+	}
+	splitURL := strings.Split(parsed.Host, ".")
+	if len(splitURL) < 4 {
+		return nil, errors.New("registry URL can't be split")
+	}
+	return &parsedURL{
+		registryID: splitURL[0],
+		region:     splitURL[3],
+		host:       parsed.Host,
+	}, nil
+}
+
+/* GETTER */
 // An interface for testing purposes.
 type tokenGetter interface {
 	GetAuthorizationToken(input *ecr.GetAuthorizationTokenInput) (*ecr.GetAuthorizationTokenOutput, error)
@@ -64,131 +102,58 @@ func (p *ecrTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationTokenI
 	return p.svc.GetAuthorizationToken(input)
 }
 
-// lazyEcrProvider is a DockerConfigProvider that creates on demand an
-// ecrProvider for a given region and then proxies requests to it.
-type lazyEcrProvider struct {
-	region         string
-	regionURL      string
-	actualProvider *credentialprovider.CachingDockerConfigProvider
-}
-
-var _ credentialprovider.DockerConfigProvider = &lazyEcrProvider{}
-
-// ecrProvider is a DockerConfigProvider that gets and refreshes 12-hour tokens
-// from AWS to access ECR.
-type ecrProvider struct {
-	region    string
-	regionURL string
-	getter    tokenGetter
-}
-
-var _ credentialprovider.DockerConfigProvider = &ecrProvider{}
-
-// registryURL has different suffix in AWS China region
-func registryURL(region string) string {
-	dnsSuffix := awsStandardDNSSuffix
-	// deal with aws none standard regions
-	if strings.HasPrefix(region, awsChinaRegionPrefix) {
-		dnsSuffix = awsChinaDNSSuffix
-	}
-	return fmt.Sprintf(registryURLTemplate, region, dnsSuffix)
-}
-
-// RegisterCredentialsProvider registers a credential provider for the specified region.
-// It creates a lazy provider for each AWS region, in order to support
-// cross-region ECR access. They have to be lazy because it's unlikely, but not
-// impossible, that we'll use more than one.
-// This should be called only if using the AWS cloud provider.
-// This way, we avoid timeouts waiting for a non-existent provider.
-func RegisterCredentialsProvider(region string) {
-	klog.V(4).Infof("registering credentials provider for AWS region %q", region)
-
-	credentialprovider.RegisterCredentialProvider("aws-ecr-"+region,
-		&lazyEcrProvider{
-			region:    region,
-			regionURL: registryURL(region),
-		})
-}
-
-// Enabled implements DockerConfigProvider.Enabled for the lazy provider.
-// Since we perform no checks/work of our own and actualProvider is only created
-// later at image pulling time (if ever), always return true.
-func (p *lazyEcrProvider) Enabled() bool {
-	return true
-}
-
-// LazyProvide implements DockerConfigProvider.LazyProvide. It will be called
-// by the client when attempting to pull an image and it will create the actual
-// provider only when we actually need it the first time.
-func (p *lazyEcrProvider) LazyProvide() *credentialprovider.DockerConfigEntry {
-	if p.actualProvider == nil {
-		klog.V(2).Infof("Creating ecrProvider for %s", p.region)
-		p.actualProvider = &credentialprovider.CachingDockerConfigProvider{
-			Provider: newEcrProvider(p.region, nil),
-			// Refresh credentials a little earlier than expiration time
-			Lifetime: 11*time.Hour + 55*time.Minute,
-		}
-		if !p.actualProvider.Enabled() {
-			return nil
-		}
-	}
-	entry := p.actualProvider.Provide()[p.regionURL]
-	return &entry
-}
-
-// Provide implements DockerConfigProvider.Provide, creating dummy credentials.
-// Client code will call Provider.LazyProvide() at image pulling time.
-func (p *lazyEcrProvider) Provide() credentialprovider.DockerConfig {
-	entry := credentialprovider.DockerConfigEntry{
-		Provider: p,
-	}
-	cfg := credentialprovider.DockerConfig{}
-	cfg[p.regionURL] = entry
-	return cfg
-}
-
-func newEcrProvider(region string, getter tokenGetter) *ecrProvider {
-	return &ecrProvider{
-		region:    region,
-		regionURL: registryURL(region),
-		getter:    getter,
-	}
-}
-
-// Enabled implements DockerConfigProvider.Enabled for the AWS token-based implementation.
-// For now, it gets activated only if AWS was chosen as the cloud provider.
-// TODO: figure how to enable it manually for deployments that are not on AWS but still
-// use ECR somehow?
-func (p *ecrProvider) Enabled() bool {
-	if p.region == "" {
-		klog.Errorf("Called ecrProvider.Enabled() with no region set")
-		return false
-	}
-
+func newGetter(region string) *ecrTokenGetter {
 	getter := &ecrTokenGetter{svc: ecr.New(session.New(&aws.Config{
 		Credentials: nil,
-		Region:      &p.region,
+		Region:      aws.String(region),
 	}))}
+	getter.svc.Handlers.Build.PushFrontNamed(request.NamedHandler{
+		Name: "k8s/user-agent",
+		Fn:   request.MakeAddToUserAgentHandler("kubernetes", version.Get().String()),
+	})
 	getter.svc.Handlers.Sign.PushFrontNamed(request.NamedHandler{
 		Name: "k8s/logger",
 		Fn:   awsHandlerLogger,
 	})
-	p.getter = getter
-
-	return true
+	return getter
 }
 
-// LazyProvide implements DockerConfigProvider.LazyProvide. Should never be called.
-func (p *ecrProvider) LazyProvide() *credentialprovider.DockerConfigEntry {
-	return nil
+/*GET CREDENTIALS*/
+type cacheEntry struct {
+	expiresAt   time.Time
+	credentials credentialprovider.DockerConfigEntry
+	host        string
 }
 
-// Provide implements DockerConfigProvider.Provide, refreshing ECR tokens on demand
-func (p *ecrProvider) Provide() credentialprovider.DockerConfig {
+// stringKeyFunc is a string as cache key function
+func stringKeyFunc(obj interface{}) (string, error) {
+	key := obj.(cacheEntry).host
+	return key, nil
+}
+
+func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.DockerConfig, bool) {
 	cfg := credentialprovider.DockerConfig{}
+	obj, exists, err := p.cache.GetByKey(parsed.host)
+	if err != nil {
+		klog.Errorf("unable to get credentials from cache for %v %v", parsed.host, err)
+		return cfg, exists
+	}
+	if exists {
+		entry := obj.(cacheEntry)
+		if entry.expiresAt.After(time.Now()) {
+			cfg[entry.host] = entry.credentials
+		}
+	}
+	return cfg, exists
+}
 
-	// TODO: fill in RegistryIds?
-	params := &ecr.GetAuthorizationTokenInput{}
+func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerConfig {
+	cfg := credentialprovider.DockerConfig{}
+	if p.getter == nil {
+		p.getter = newGetter(parsed.region)
+	}
+
+	params := &ecr.GetAuthorizationTokenInput{RegistryIds: []*string{aws.String(parsed.registryID)}}
 	output, err := p.getter.GetAuthorizationToken(params)
 	if err != nil {
 		klog.Errorf("while requesting ECR authorization token %v", err)
@@ -199,29 +164,98 @@ func (p *ecrProvider) Provide() credentialprovider.DockerConfig {
 		return cfg
 	}
 
-	for _, data := range output.AuthorizationData {
-		if data.ProxyEndpoint != nil &&
-			data.AuthorizationToken != nil {
-			decodedToken, err := base64.StdEncoding.DecodeString(aws.StringValue(data.AuthorizationToken))
-			if err != nil {
-				klog.Errorf("while decoding token for endpoint %v %v", data.ProxyEndpoint, err)
-				return cfg
-			}
-			parts := strings.SplitN(string(decodedToken), ":", 2)
-			user := parts[0]
-			password := parts[1]
-			entry := credentialprovider.DockerConfigEntry{
-				Username: user,
-				Password: password,
-				// ECR doesn't care and Docker is about to obsolete it
-				Email: "not@val.id",
-			}
-
-			klog.V(3).Infof("Adding credentials for user %s in %s", user, p.region)
-			// Add our config entry for this region's registry URLs
-			cfg[p.regionURL] = entry
-
+	data := output.AuthorizationData[0]
+	if data.ProxyEndpoint != nil &&
+		data.AuthorizationToken != nil {
+		decodedToken, err := base64.StdEncoding.DecodeString(aws.StringValue(data.AuthorizationToken))
+		if err != nil {
+			klog.Errorf("while decoding token for endpoint %v %v", data.ProxyEndpoint, err)
+			return cfg
 		}
+		parts := strings.SplitN(string(decodedToken), ":", 2)
+		user := parts[0]
+		password := parts[1]
+		creds := credentialprovider.DockerConfigEntry{
+			Username: user,
+			Password: password,
+			// ECR doesn't care and Docker is about to obsolete it
+			Email: "not@val.id",
+		}
+		entry := cacheEntry{
+			expiresAt:   *data.ExpiresAt,
+			credentials: creds,
+			host:        parsed.host,
+		}
+		if err := p.cache.Add(entry); err != nil {
+			klog.Errorf("while adding entry to cache %v", err)
+			return cfg
+		}
+		cfg[entry.host] = entry.credentials
+	}
+	return cfg
+}
+
+/*PROVIDER*/
+// ecrProvider is a DockerConfigProvider that gets and refreshes tokens
+// from AWS to access ECR.
+type ecrProvider struct {
+	registryURLTemplate string
+	cache               cache.Store
+	getter              tokenGetter
+}
+
+var _ credentialprovider.DockerConfigProvider = &ecrProvider{}
+
+// RegisterCredentialsProvider registers a credential provider for the specified region.
+// It creates a lazy provider for each AWS region, in order to support
+// cross-region ECR access. They have to be lazy because it's unlikely, but not
+// impossible, that we'll use more than one.
+// This should be called only if using the AWS cloud provider.
+// This way, we avoid timeouts waiting for a non-existent provider.
+func init() {
+	credentialprovider.RegisterCredentialProvider("aws-ecr-partition-standard",
+		newECRProvider(registryURLTemplateStandard, nil))
+
+	credentialprovider.RegisterCredentialProvider("aws-ecr-partition-china",
+		newECRProvider(registryURLTemplateChina, nil))
+}
+
+func newECRProvider(template string, getter tokenGetter) *ecrProvider {
+	//make cache
+	//key: repotoPull host only component. Don't want port, don't want repository v: ecrCache struct
+
+	return &ecrProvider{
+		registryURLTemplate: template,
+		cache:               cache.NewTTLStore(stringKeyFunc, 1*time.Hour),
+		getter:              getter,
+	}
+}
+
+// Enabled implements DockerConfigProvider.Enabled for the AWS token-based implementation.
+// For now, it gets activated only if AWS was chosen as the cloud provider.
+// TODO: figure how to enable it manually for deployments that are not on AWS but still
+// use ECR somehow?
+func (p *ecrProvider) Enabled() bool {
+	return true
+}
+
+// LazyProvide is lazy
+func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerConfigEntry {
+	return nil
+}
+
+// Provide provides credentials from the cache if they are found, or from ECR
+func (p *ecrProvider) Provide(repoToPull string) credentialprovider.DockerConfig {
+	cfg := credentialprovider.DockerConfig{}
+
+	parsed, err := splitSchemelessURL(repoToPull)
+	if err != nil {
+		klog.Errorf("unable to parse repo url %s %v", repoToPull, err)
+		return cfg
+	}
+	cfg, exists := p.getFromCache(parsed)
+	if !exists {
+		return p.getFromECR(parsed)
 	}
 	return cfg
 }
