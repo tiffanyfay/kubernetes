@@ -132,22 +132,32 @@ func stringKeyFunc(obj interface{}) (string, error) {
 }
 
 func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.DockerConfig, bool) {
+	klog.Infof("Checking cache for credentials for %v", parsed.host)
 	cfg := credentialprovider.DockerConfig{}
 	obj, exists, err := p.cache.GetByKey(parsed.host)
 	if err != nil {
-		klog.Errorf("unable to get credentials from cache for %v %v", parsed.host, err)
+		klog.Infof("unable to get credentials from cache for %v %v", parsed.host, err)
 		return cfg, exists
 	}
 	if exists {
 		entry := obj.(cacheEntry)
 		if entry.expiresAt.After(time.Now()) {
+			klog.Info("Credentials found in cache")
 			cfg[entry.host] = entry.credentials
+		} else {
+			klog.Info("Credentials in cache are expired")
+			// if entry is past the ECR expiration policy, remove item from cache
+			if err := p.cache.Delete(obj); err != nil {
+				klog.Errorf("while removing expired entry from cache %v", err)
+			}
+			exists = false
 		}
 	}
 	return cfg, exists
 }
 
 func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerConfig {
+	klog.Infof("Getting credentials from ECR for %v", parsed.host)
 	cfg := credentialprovider.DockerConfig{}
 	if p.getter == nil {
 		p.getter = newGetter(parsed.region)
