@@ -19,7 +19,9 @@ package credentials
 import (
 	"encoding/base64"
 	"fmt"
+	"math/rand"
 	"path"
+	"strconv"
 	"testing"
 	"time"
 
@@ -35,15 +37,21 @@ const email = "not@val.id"
 
 // Mock implementation
 type testTokenGetter struct {
-	user     string
-	password string
-	endpoint string
+	user              string
+	password          string
+	endpoint          string
+	randomizePassword bool
 }
 
 func (p *testTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationTokenInput) (*ecr.GetAuthorizationTokenOutput, error) {
-
-	expiration := time.Now().Add(1 * time.Hour)
-	creds := []byte(fmt.Sprintf("%s:%s", p.user, p.password))
+	password := p.password
+	if p.randomizePassword {
+		rand.Seed(int64(time.Now().Nanosecond()))
+		password = strconv.Itoa(rand.Int())
+	}
+	// expiration := time.Now().Add(1 * time.Hour)
+	expiration := time.Now().Add(5 * time.Second)
+	creds := []byte(fmt.Sprintf("%s:%s", p.user, password))
 	data := &ecr.AuthorizationData{
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString(creds)),
 		ExpiresAt:          &expiration,
@@ -56,7 +64,7 @@ func (p *testTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationToken
 	return output, nil //p.svc.GetAuthorizationToken(input)
 }
 
-func TestEcrProvide(t *testing.T) {
+func TestECRProvide(t *testing.T) {
 	registry := "123456789012.dkr.ecr.lala-land-1.amazonaws.com"
 	otherRegistries := []string{
 		"123456789012.dkr.ecr.cn-foo-1.amazonaws.com.cn",
@@ -64,23 +72,21 @@ func TestEcrProvide(t *testing.T) {
 		"gcr.io",
 	}
 	image := "foo/bar"
-
-	provider := newEcrProvider("lala-land-1",
+	repoToPull := path.Join(registry, image)
+	p := newECRProvider(registryURLTemplateStandard,
 		&testTokenGetter{
 			user:     user,
 			password: password,
 			endpoint: registry,
 		})
-
 	keyring := &credentialprovider.BasicDockerKeyring{}
-	keyring.Add(provider.Provide())
+	keyring.Add(p.Provide(repoToPull))
 
 	// Verify that we get the expected username/password combo for
 	// an ECR image name.
-	fullImage := path.Join(registry, image)
-	creds, ok := keyring.Lookup(fullImage)
+	creds, ok := keyring.Lookup(repoToPull)
 	if !ok {
-		t.Errorf("Didn't find expected URL: %s", fullImage)
+		t.Errorf("Didn't find expected URL: %s", registry)
 		return
 	}
 	if len(creds) > 1 {
@@ -100,16 +106,50 @@ func TestEcrProvide(t *testing.T) {
 
 	// Verify that we get an error for other images.
 	for _, otherRegistry := range otherRegistries {
-		fullImage = path.Join(otherRegistry, image)
-		creds, ok = keyring.Lookup(fullImage)
+		// fullImage = path.Join(otherRegistry, image)
+		creds, ok = keyring.Lookup(otherRegistry)
 		if ok {
-			t.Errorf("Unexpectedly found image: %s", fullImage)
+			t.Errorf("Unexpectedly found image: %s", otherRegistry)
 			return
 		}
 	}
 }
 
-func TestChinaEcrProvide(t *testing.T) {
+func TestECRProvideCached(t *testing.T) {
+	registry := "123456789012.dkr.ecr.lala-land-1.amazonaws.com"
+	image1 := "foo/bar"
+	image2 := "bar/baz"
+	p := newECRProvider(registryURLTemplateStandard,
+		&testTokenGetter{
+			user:              user,
+			password:          password,
+			endpoint:          registry,
+			randomizePassword: true,
+		})
+
+	repoToPull1 := path.Join(registry, image1)
+	repoToPull2 := path.Join(registry, image2)
+	keyring := &credentialprovider.BasicDockerKeyring{}
+	keyring.Add(p.Provide(repoToPull1))
+	// time.Sleep(6 * time.Second)
+	keyring.Add(p.Provide(repoToPull2))
+	// Verify that we get the credentials from the
+	// cache the second time
+	creds, ok := keyring.Lookup(repoToPull)
+	if !ok {
+		t.Errorf("Didn't find expected URL: %s", repoToPull)
+		return
+	}
+	if len(creds) != 2 {
+		t.Errorf("Got more hits than expected: %s", creds)
+	}
+
+	if creds[0].Password != creds[1].Password {
+		t.Errorf("cached credentials do not match")
+	}
+}
+
+func TestChinaECRProvide(t *testing.T) {
 	registry := "123456789012.dkr.ecr.cn-foo-1.amazonaws.com.cn"
 	otherRegistries := []string{
 		"123456789012.dkr.ecr.lala-land-1.amazonaws.com",
@@ -117,23 +157,22 @@ func TestChinaEcrProvide(t *testing.T) {
 		"gcr.io",
 	}
 	image := "foo/bar"
-
-	provider := newEcrProvider("cn-foo-1",
+	repoToPull := path.Join(registry, image)
+	p := newECRProvider(registryURLTemplateChina,
 		&testTokenGetter{
 			user:     user,
 			password: password,
 			endpoint: registry,
 		})
-
 	keyring := &credentialprovider.BasicDockerKeyring{}
-	keyring.Add(provider.Provide())
+	keyring.Add(p.Provide(repoToPull))
 
 	// Verify that we get the expected username/password combo for
 	// an ECR image name.
-	fullImage := path.Join(registry, image)
-	creds, ok := keyring.Lookup(fullImage)
+
+	creds, ok := keyring.Lookup(registry)
 	if !ok {
-		t.Errorf("Didn't find expected URL: %s", fullImage)
+		t.Errorf("Didn't find expected URL: %s", repoToPull)
 		return
 	}
 	if len(creds) > 1 {
@@ -153,11 +192,44 @@ func TestChinaEcrProvide(t *testing.T) {
 
 	// Verify that we get an error for other images.
 	for _, otherRegistry := range otherRegistries {
-		fullImage = path.Join(otherRegistry, image)
-		creds, ok = keyring.Lookup(fullImage)
+		// fullImage = path.Join(otherRegistry, image)
+		creds, ok = keyring.Lookup(otherRegistry)
 		if ok {
-			t.Errorf("Unexpectedly found image: %s", fullImage)
+			t.Errorf("Unexpectedly found image: %s", otherRegistry)
 			return
 		}
+	}
+}
+
+func TestChinaECRProvideCached(t *testing.T) {
+	registry := "123456789012.dkr.ecr.cn-foo-1.amazonaws.com.cn"
+	image := "foo/bar"
+
+	p := newECRProvider(registryURLTemplateChina,
+		&testTokenGetter{
+			user:              user,
+			password:          password,
+			endpoint:          registry,
+			randomizePassword: true,
+		})
+
+	repoToPull := path.Join(registry, image)
+	keyring := &credentialprovider.BasicDockerKeyring{}
+	keyring.Add(p.Provide(repoToPull))
+	// time.Sleep(6 * time.Second)
+	keyring.Add(p.Provide(repoToPull))
+	// Verify that we get the credentials from the
+	// cache the second time
+	creds, ok := keyring.Lookup(repoToPull)
+	if !ok {
+		t.Errorf("Didn't find expected URL: %s", repoToPull)
+		return
+	}
+	if len(creds) != 2 {
+		t.Errorf("Got more hits than expected: %s", creds)
+	}
+
+	if creds[0].Password != creds[1].Password {
+		t.Errorf("cached credentials do not match")
 	}
 }
