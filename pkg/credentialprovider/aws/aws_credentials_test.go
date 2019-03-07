@@ -49,7 +49,8 @@ func (p *testTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationToken
 		rand.Seed(int64(time.Now().Nanosecond()))
 		password = strconv.Itoa(rand.Int())
 	}
-	expiration := time.Now().Add(1 * time.Hour)
+	// expiration := time.Now().Add(1 * time.Hour)
+	expiration := time.Now().Add(5 * time.Second)
 	creds := []byte(fmt.Sprintf("%s:%s", p.user, password))
 	data := &ecr.AuthorizationData{
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString(creds)),
@@ -116,7 +117,8 @@ func TestECRProvide(t *testing.T) {
 
 func TestECRProvideCached(t *testing.T) {
 	registry := "123456789012.dkr.ecr.lala-land-1.amazonaws.com"
-	image := "foo/bar"
+	image1 := "foo/bar"
+	image2 := "bar/baz"
 	p := newECRProvider(registryURLTemplateStandard,
 		&testTokenGetter{
 			user:              user,
@@ -125,10 +127,12 @@ func TestECRProvideCached(t *testing.T) {
 			randomizePassword: true,
 		})
 
-	repoToPull := path.Join(registry, image)
+	repoToPull1 := path.Join(registry, image1)
+	repoToPull2 := path.Join(registry, image2)
 	keyring := &credentialprovider.BasicDockerKeyring{}
-	keyring.Add(p.Provide(repoToPull))
-	keyring.Add(p.Provide(repoToPull))
+	keyring.Add(p.Provide(repoToPull1))
+	// time.Sleep(6 * time.Second)
+	keyring.Add(p.Provide(repoToPull2))
 	// Verify that we get the credentials from the
 	// cache the second time
 	creds, ok := keyring.Lookup(repoToPull)
@@ -212,6 +216,7 @@ func TestChinaECRProvideCached(t *testing.T) {
 	repoToPull := path.Join(registry, image)
 	keyring := &credentialprovider.BasicDockerKeyring{}
 	keyring.Add(p.Provide(repoToPull))
+	// time.Sleep(6 * time.Second)
 	keyring.Add(p.Provide(repoToPull))
 	// Verify that we get the credentials from the
 	// cache the second time

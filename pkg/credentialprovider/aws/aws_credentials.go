@@ -19,6 +19,7 @@ package credentials
 import (
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -27,9 +28,13 @@ import (
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ecr"
+
+	// "github.com/tiffanyfay/client-go/tools/cache"
+
 	"k8s.io/klog"
 
 	"k8s.io/client-go/tools/cache"
+
 	"k8s.io/kubernetes/pkg/credentialprovider"
 	"k8s.io/kubernetes/pkg/version"
 )
@@ -98,6 +103,7 @@ type ecrTokenGetter struct {
 	svc *ecr.ECR
 }
 
+//TODO
 func (p *ecrTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationTokenInput) (*ecr.GetAuthorizationTokenOutput, error) {
 	return p.svc.GetAuthorizationToken(input)
 }
@@ -118,12 +124,30 @@ func newGetter(region string) *ecrTokenGetter {
 	return getter
 }
 
-/*GET CREDENTIALS*/
+/*CACHE*/
+// type TimeFunc func(obj interface{}) (time.Time, error)
+
+// type expirationPolicy interface {
+
 type cacheEntry struct {
 	expiresAt   time.Time
 	credentials credentialprovider.DockerConfigEntry
 	host        string
 }
+
+// ecrExpirationPolicy implements ExpirationPolicy.
+type ecrExpirationPolicy struct{}
+
+// func newExpirationPolicy() *ecrExpirationPolicy {
+// 	return &ecrExpirationPolicy{
+// 		expiresAtFunc: expiresAtFunc,
+// 	}
+// }
+
+// func expiresAtFunc(obj interface{}) (time.Time, error) {
+// 	expiresAt := obj.(cacheEntry).expiresAt
+// 	return expiresAt, nil
+// }
 
 // stringKeyFunc is a string as cache key function
 func stringKeyFunc(obj interface{}) (string, error) {
@@ -131,6 +155,12 @@ func stringKeyFunc(obj interface{}) (string, error) {
 	return key, nil
 }
 
+func (p *ecrExpirationPolicy) IsExpired(entry *cache.TimestampedEntry) bool {
+	expiresAt := entry.Obj.(cacheEntry).expiresAt
+	return expiresAt.Before(time.Now()) //TODO clear before expiration
+}
+
+/*GET CREDENTIALS*/
 func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.DockerConfig, bool) {
 	klog.Infof("Checking cache for credentials for %v", parsed.host)
 	cfg := credentialprovider.DockerConfig{}
@@ -141,17 +171,11 @@ func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.Docker
 	}
 	if exists {
 		entry := obj.(cacheEntry)
-		if entry.expiresAt.After(time.Now()) {
-			klog.Info("Credentials found in cache")
-			cfg[entry.host] = entry.credentials
-		} else {
-			klog.Info("Credentials in cache are expired")
-			// if entry is past the ECR expiration policy, remove item from cache
-			if err := p.cache.Delete(obj); err != nil {
-				klog.Errorf("while removing expired entry from cache %v", err)
-			}
-			exists = false
-		}
+		klog.Info("Credentials found in cache")
+		fmt.Println("in cache")
+		cfg[entry.host] = entry.credentials
+	} else {
+		fmt.Println("not in cache") //TODO
 	}
 	return cfg, exists
 }
@@ -216,29 +240,24 @@ type ecrProvider struct {
 
 var _ credentialprovider.DockerConfigProvider = &ecrProvider{}
 
-// RegisterCredentialsProvider registers a credential provider for the specified region.
-// It creates a lazy provider for each AWS region, in order to support
-// cross-region ECR access. They have to be lazy because it's unlikely, but not
-// impossible, that we'll use more than one.
-// This should be called only if using the AWS cloud provider.
-// This way, we avoid timeouts waiting for a non-existent provider.
+func newECRProvider(template string, getter tokenGetter) *ecrProvider {
+	return &ecrProvider{
+		registryURLTemplate: template,
+		// cache:               cache.NewTTLStore(stringKeyFunc, 1*time.Hour),
+		cache:  cache.NewStoreWithPolicy(stringKeyFunc, &ecrExpirationPolicy{}),
+		getter: getter,
+	}
+}
+
+// init registers a credential provider for the specified region.
+// It creates a provider for each registryURLTemplate, in order to
+// support cross-region ECR access.
 func init() {
 	credentialprovider.RegisterCredentialProvider("aws-ecr-partition-standard",
 		newECRProvider(registryURLTemplateStandard, nil))
 
 	credentialprovider.RegisterCredentialProvider("aws-ecr-partition-china",
 		newECRProvider(registryURLTemplateChina, nil))
-}
-
-func newECRProvider(template string, getter tokenGetter) *ecrProvider {
-	//make cache
-	//key: repotoPull host only component. Don't want port, don't want repository v: ecrCache struct
-
-	return &ecrProvider{
-		registryURLTemplate: template,
-		cache:               cache.NewTTLStore(stringKeyFunc, 1*time.Hour),
-		getter:              getter,
-	}
 }
 
 // Enabled implements DockerConfigProvider.Enabled for the AWS token-based implementation.
