@@ -19,7 +19,6 @@ package credentials
 import (
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -29,12 +28,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ecr"
 
-	// "github.com/tiffanyfay/client-go/tools/cache"
-
-	"k8s.io/klog"
-
 	"k8s.io/client-go/tools/cache"
-
+	"k8s.io/klog"
 	"k8s.io/kubernetes/pkg/credentialprovider"
 	"k8s.io/kubernetes/pkg/version"
 )
@@ -63,24 +58,18 @@ type parsedURL struct {
 	host       string
 }
 
-// url.Parse require a scheme, but ours don't have schemes.  Adding a
-// scheme to make url.Parse happy, then clear out the resulting scheme.
-func parseSchemelessURL(schemelessURL string) (*url.URL, error) {
-	parsed, err := url.Parse("https://" + schemelessURL)
-	if err != nil {
-		return nil, err
-	}
-	// clear out the resulting scheme
-	parsed.Scheme = ""
-	return parsed, nil
-}
-
-func splitSchemelessURL(repoToPull string) (*parsedURL, error) {
-	parsed, err := parseSchemelessURL(repoToPull)
+// parseRegistryURL parses and splits the URL into the registry ID,
+// region, and host. url.Parse requires a scheme, but ours don't have schemes.
+// Adding a scheme to make url.Parse happy, then clear out the resulting scheme.
+func parseRegistryURL(repoToPull string) (*parsedURL, error) {
+	parsed, err := url.Parse("https://" + repoToPull)
 	if err != nil {
 		klog.Errorf("unable to parse registry URL %v", err)
 		return nil, err
 	}
+	// clear out the resulting scheme
+	parsed.Scheme = ""
+
 	splitURL := strings.Split(parsed.Host, ".")
 	if len(splitURL) < 4 {
 		return nil, errors.New("registry URL can't be split")
@@ -164,18 +153,15 @@ func (p *ecrExpirationPolicy) IsExpired(entry *cache.TimestampedEntry) bool {
 func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.DockerConfig, bool) {
 	klog.Infof("Checking cache for credentials for %v", parsed.host)
 	cfg := credentialprovider.DockerConfig{}
+
 	obj, exists, err := p.cache.GetByKey(parsed.host)
 	if err != nil {
-		klog.Infof("unable to get credentials from cache for %v %v", parsed.host, err)
+		klog.Warningf("unable to get credentials from cache for %v %v", parsed.host, err)
 		return cfg, exists
 	}
 	if exists {
 		entry := obj.(cacheEntry)
-		klog.Info("Credentials found in cache")
-		fmt.Println("in cache")
 		cfg[entry.host] = entry.credentials
-	} else {
-		fmt.Println("not in cache") //TODO
 	}
 	return cfg, exists
 }
@@ -243,9 +229,8 @@ var _ credentialprovider.DockerConfigProvider = &ecrProvider{}
 func newECRProvider(template string, getter tokenGetter) *ecrProvider {
 	return &ecrProvider{
 		registryURLTemplate: template,
-		// cache:               cache.NewTTLStore(stringKeyFunc, 1*time.Hour),
-		cache:  cache.NewStoreWithPolicy(stringKeyFunc, &ecrExpirationPolicy{}),
-		getter: getter,
+		cache:               cache.NewStoreWithPolicy(stringKeyFunc, &ecrExpirationPolicy{}),
+		getter:              getter,
 	}
 }
 
@@ -277,9 +262,8 @@ func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerC
 func (p *ecrProvider) Provide(repoToPull string) credentialprovider.DockerConfig {
 	cfg := credentialprovider.DockerConfig{}
 
-	parsed, err := splitSchemelessURL(repoToPull)
+	parsed, err := parseRegistryURL(repoToPull)
 	if err != nil {
-		klog.Errorf("unable to parse repo url %s %v", repoToPull, err)
 		return cfg
 	}
 	cfg, exists := p.getFromCache(parsed)
