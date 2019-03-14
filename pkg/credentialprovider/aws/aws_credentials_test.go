@@ -70,15 +70,15 @@ func (p *testTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationToken
 	return output, nil //p.svc.GetAuthorizationToken(input)
 }
 
-func TestParseRegistryURL(t *testing.T) {
+func TestParseRepoURLPass(t *testing.T) {
 	registryID := "123456789012"
 	region := "lala-land-1"
 	registry := "123456789012.dkr.ecr.lala-land-1.amazonaws.com"
 	repoToPull := path.Join(registry, "foo/bar")
-	parsedURL, err := parseRegistryURL(repoToPull)
+	parsedURL, err := parseRepoURL(repoToPull)
 
 	if err != nil {
-		t.Errorf("Could not parse registry URL: %s", repoToPull)
+		t.Errorf("Could not parse URL: %s, err: %v", repoToPull, err)
 	}
 	if registryID != parsedURL.registryID {
 		t.Errorf("Unexpected registryID value, want: %s, got: %s", registryID, parsedURL.registryID)
@@ -88,6 +88,23 @@ func TestParseRegistryURL(t *testing.T) {
 	}
 	if registry != parsedURL.registry {
 		t.Errorf("Unexpected registry value, want: %s, got: %s", registry, parsedURL.registry)
+	}
+}
+
+func TestParseRepoURLFail(t *testing.T) {
+	registry := "123456789012.amazonaws.com"
+	repoToPull := path.Join(registry, "foo/bar")
+	parsedURL, err := parseRepoURL(repoToPull)
+	expectedErr := "repository URL 123456789012.amazonaws.com improperly formatted"
+
+	if err == nil {
+		t.Errorf("Should fail to parse URL %s", repoToPull)
+	}
+	if err.Error() != expectedErr {
+		t.Errorf("Unexpected error, want: %s, got: %v", expectedErr, err)
+	}
+	if parsedURL != nil {
+		t.Errorf("Expected parsedURL to be nil")
 	}
 }
 
@@ -257,7 +274,6 @@ func TestChinaECRProvideCached(t *testing.T) {
 				randomizePassword: true,
 			},
 		})
-
 	repoToPull := path.Join(registry, image)
 	keyring := &credentialprovider.BasicDockerKeyring{}
 	keyring.Add(p.Provide(repoToPull))

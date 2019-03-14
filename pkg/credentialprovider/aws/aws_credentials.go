@@ -73,6 +73,7 @@ func (p *ecrProvider) Enabled() bool {
 }
 
 // LazyProvide is lazy
+// TODO: LazyProvide will be removed shortly
 func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerConfigEntry {
 	return nil
 }
@@ -80,17 +81,14 @@ func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerC
 // Provide returns a DockerConfig with credentials from the cache if they are
 // found, or from ECR
 func (p *ecrProvider) Provide(repoToPull string) credentialprovider.DockerConfig {
-	cfg := credentialprovider.DockerConfig{}
-
-	parsed, err := parseRegistryURL(repoToPull)
+	parsed, err := parseRepoURL(repoToPull)
 	if err != nil {
+		return credentialprovider.DockerConfig{}
+	}
+	if cfg, exists := p.getFromCache(parsed); exists {
 		return cfg
 	}
-	cfg, exists := p.getFromCache(parsed)
-	if !exists {
-		return p.getFromECR(parsed)
-	}
-	return cfg
+	return p.getFromECR(parsed)
 }
 
 // getFromCache attempts to get credentials from the cache
@@ -104,7 +102,7 @@ func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.Docker
 		return cfg, exists
 	}
 	if exists {
-		entry := obj.(cacheEntry)
+		entry := obj.(*cacheEntry)
 		cfg[entry.registry] = entry.credentials
 	}
 	return cfg, exists
@@ -132,35 +130,38 @@ func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerCon
 	}
 	data := output.AuthorizationData[0]
 	if data.AuthorizationToken == nil {
-		klog.Errorf("Authorization token is not set")
+		klog.Errorf("Got back no authorization token")
 		return cfg
 	}
-	if data.ProxyEndpoint != nil {
-		decodedToken, err := base64.StdEncoding.DecodeString(aws.StringValue(data.AuthorizationToken))
-		if err != nil {
-			klog.Errorf("while decoding token for endpoint %v %v", data.ProxyEndpoint, err)
-			return cfg
-		}
-		parts := strings.SplitN(string(decodedToken), ":", 2)
-		user := parts[0]
-		password := parts[1]
-		creds := credentialprovider.DockerConfigEntry{
-			Username: user,
-			Password: password,
-			// ECR doesn't care and Docker is about to obsolete it
-			Email: "not@val.id",
-		}
-		entry := cacheEntry{
-			expiresAt:   *data.ExpiresAt,
-			credentials: creds,
-			registry:    parsed.registry,
-		}
-		if err := p.cache.Add(entry); err != nil {
-			klog.Errorf("while adding entry to cache %v", err)
-			return cfg
-		}
-		cfg[entry.registry] = entry.credentials
+	if data.ProxyEndpoint == nil {
+		klog.Errorf("Got back no proxy endpoint")
+		return cfg
 	}
+
+	decodedToken, err := base64.StdEncoding.DecodeString(aws.StringValue(data.AuthorizationToken))
+	if err != nil {
+		klog.Errorf("while decoding token for endpoint %v %v", data.ProxyEndpoint, err)
+		return cfg
+	}
+	parts := strings.SplitN(string(decodedToken), ":", 2)
+	user := parts[0]
+	password := parts[1]
+	creds := credentialprovider.DockerConfigEntry{
+		Username: user,
+		Password: password,
+		// ECR doesn't care and Docker is about to obsolete it
+		Email: "not@val.id",
+	}
+	entry := &cacheEntry{
+		expiresAt:   *data.ExpiresAt,
+		credentials: creds,
+		registry:    parsed.registry,
+	}
+	if err := p.cache.Add(entry); err != nil {
+		klog.Errorf("while adding entry to cache %v", err)
+		return cfg
+	}
+	cfg[entry.registry] = entry.credentials
 	return cfg
 }
 
@@ -170,17 +171,17 @@ type parsedURL struct {
 	registry   string
 }
 
-// parseRegistryURL parses and splits the registry URL into the registry ID,
+// parseRepoURL parses and splits the registry URL into the registry ID,
 // region, and registry.
-func parseRegistryURL(repoToPull string) (*parsedURL, error) {
+func parseRepoURL(repoToPull string) (*parsedURL, error) {
 	parsed, err := url.Parse("https://" + repoToPull)
 	if err != nil {
-		klog.Errorf("unable to parse registry URL %v", err)
+		klog.Errorf("unable to parse repository URL %v", err)
 		return nil, err
 	}
 	splitURL := strings.Split(parsed.Host, ".")
 	if len(splitURL) < 4 {
-		return nil, fmt.Errorf("registry URL %s improperly formatted", parsed.Host)
+		return nil, fmt.Errorf("repository URL %s improperly formatted", parsed.Host)
 	}
 	return &parsedURL{
 		registryID: splitURL[0],
@@ -264,12 +265,12 @@ type ecrExpirationPolicy struct{}
 
 // stringKeyFunc returns the cache key as a string
 func stringKeyFunc(obj interface{}) (string, error) {
-	key := obj.(cacheEntry).registry
+	key := obj.(*cacheEntry).registry
 	return key, nil
 }
 
 // IsExpired checks if the ECR credentials are past the expiredAt time
 func (p *ecrExpirationPolicy) IsExpired(entry *cache.TimestampedEntry) bool {
-	expiresAt := entry.Obj.(cacheEntry).expiresAt
+	expiresAt := entry.Obj.(*cacheEntry).expiresAt
 	return expiresAt.Before(time.Now()) //TODO clear before expiration
 }
