@@ -52,14 +52,13 @@ func (f *testTokenGetterFactory) GetTokenGetterForRegion(region string) tokenGet
 }
 
 func (p *testTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationTokenInput) (*ecr.GetAuthorizationTokenOutput, error) {
-	password := p.password
 	if p.randomizePassword {
 		rand.Seed(int64(time.Now().Nanosecond()))
-		password = strconv.Itoa(rand.Int())
+		p.password = strconv.Itoa(rand.Int())
 	}
 	expiration := time.Now().Add(1 * time.Hour)
 	// expiration := time.Now().Add(5 * time.Second) //for testing with the cache expiring
-	creds := []byte(fmt.Sprintf("%s:%s", p.user, password))
+	creds := []byte(fmt.Sprintf("%s:%s", p.user, p.password))
 	data := &ecr.AuthorizationData{
 		AuthorizationToken: aws.String(base64.StdEncoding.EncodeToString(creds)),
 		ExpiresAt:          &expiration,
@@ -68,7 +67,6 @@ func (p *testTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationToken
 	output := &ecr.GetAuthorizationTokenOutput{
 		AuthorizationData: []*ecr.AuthorizationData{data},
 	}
-
 	return output, nil //p.svc.GetAuthorizationToken(input)
 }
 

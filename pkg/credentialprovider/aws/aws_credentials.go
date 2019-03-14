@@ -18,7 +18,7 @@ package credentials
 
 import (
 	"encoding/base64"
-	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -37,9 +37,8 @@ import (
 const registryURLTemplateStandard = "*.dkr.ecr.*.amazonaws.com"
 const registryURLTemplateChina = "*.dkr.ecr.*.amazonaws.com.cn"
 
-// init registers a credential provider for the specified region.
-// It creates a provider for each registryURLTemplate, in order to
-// support cross-region ECR access.
+// init registers a credential provider for each registryURLTemplate and creates
+// an ECR token getter factory with a new cache to store token getters
 func init() {
 	credentialprovider.RegisterCredentialProvider("aws-ecr-partition-standard",
 		newECRProvider(registryURLTemplateStandard,
@@ -50,7 +49,6 @@ func init() {
 			&ecrTokenGetterFactory{cache: make(map[string]tokenGetter)}))
 }
 
-/*PROVIDER*/
 // ecrProvider is a DockerConfigProvider that gets and refreshes tokens
 // from AWS to access ECR.
 type ecrProvider struct {
@@ -69,10 +67,7 @@ func newECRProvider(template string, getterFactory tokenGetterFactory) *ecrProvi
 	}
 }
 
-// Enabled implements DockerConfigProvider.Enabled for the AWS token-based implementation.
-// For now, it gets activated only if AWS was chosen as the cloud provider.
-// TODO: figure how to enable it manually for deployments that are not on AWS but still
-// use ECR somehow?
+// Enabled implements DockerConfigProvider.Enabled
 func (p *ecrProvider) Enabled() bool {
 	return true
 }
@@ -82,7 +77,8 @@ func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerC
 	return nil
 }
 
-// Provide provides credentials from the cache if they are found, or from ECR
+// Provide returns a DockerConfig with credentials from the cache if they are
+// found, or from ECR
 func (p *ecrProvider) Provide(repoToPull string) credentialprovider.DockerConfig {
 	cfg := credentialprovider.DockerConfig{}
 
@@ -97,7 +93,7 @@ func (p *ecrProvider) Provide(repoToPull string) credentialprovider.DockerConfig
 	return cfg
 }
 
-/*GET CREDENTIALS*/
+// getFromCache attempts to get credentials from the cache
 func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.DockerConfig, bool) {
 	klog.Infof("Checking cache for credentials for %v", parsed.registry)
 	cfg := credentialprovider.DockerConfig{}
@@ -114,6 +110,7 @@ func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.Docker
 	return cfg, exists
 }
 
+// getFromECR gets credentials from ECR since they are not in the cache
 func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerConfig {
 	klog.Infof("Getting credentials from ECR for %v", parsed.registry)
 	cfg := credentialprovider.DockerConfig{}
@@ -129,10 +126,16 @@ func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerCon
 		klog.Errorf("Got back no ECR token")
 		return cfg
 	}
-
+	if len(output.AuthorizationData) == 0 {
+		klog.Errorf("Got back no ECR authorization data")
+		return cfg
+	}
 	data := output.AuthorizationData[0]
-	if data.ProxyEndpoint != nil &&
-		data.AuthorizationToken != nil {
+	if data.AuthorizationToken == nil {
+		klog.Errorf("Authorization token is not set")
+		return cfg
+	}
+	if data.ProxyEndpoint != nil {
 		decodedToken, err := base64.StdEncoding.DecodeString(aws.StringValue(data.AuthorizationToken))
 		if err != nil {
 			klog.Errorf("while decoding token for endpoint %v %v", data.ProxyEndpoint, err)
@@ -161,28 +164,23 @@ func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerCon
 	return cfg
 }
 
-/*PARSE*/
 type parsedURL struct {
 	registryID string
 	region     string
 	registry   string
 }
 
-// parseRegistryURL parses and splits the URL into the registry ID,
-// region, and registry. url.Parse requires a scheme, but ours don't have schemes.
-// Adding a scheme to make url.Parse happy, then clear out the resulting scheme.
+// parseRegistryURL parses and splits the registry URL into the registry ID,
+// region, and registry.
 func parseRegistryURL(repoToPull string) (*parsedURL, error) {
 	parsed, err := url.Parse("https://" + repoToPull)
 	if err != nil {
 		klog.Errorf("unable to parse registry URL %v", err)
 		return nil, err
 	}
-	// clear out the resulting scheme
-	parsed.Scheme = ""
-
 	splitURL := strings.Split(parsed.Host, ".")
 	if len(splitURL) < 4 {
-		return nil, errors.New("registry URL can't be split")
+		return nil, fmt.Errorf("registry URL %s improperly formatted", parsed.Host)
 	}
 	return &parsedURL{
 		registryID: splitURL[0],
@@ -191,15 +189,17 @@ func parseRegistryURL(repoToPull string) (*parsedURL, error) {
 	}, nil
 }
 
-/* GETTER */
+// tokenGetter is for testing purposes
 type tokenGetter interface {
 	GetAuthorizationToken(input *ecr.GetAuthorizationTokenInput) (*ecr.GetAuthorizationTokenOutput, error)
 }
 
+// tokenGetterFactory is for testing purposes
 type tokenGetterFactory interface {
 	GetTokenGetterForRegion(string) tokenGetter
 }
 
+// ecrTokenGetterFactory stores a token getter per region
 type ecrTokenGetterFactory struct {
 	cache map[string]tokenGetter
 }
@@ -233,6 +233,8 @@ func newECRTokenGetter(region string) tokenGetter {
 	return getter
 }
 
+// GetTokenGetterForRegion gets the token getter for the requested region. If it
+// doesn't exist, it creates a new ECR token getter
 func (f *ecrTokenGetterFactory) GetTokenGetterForRegion(region string) tokenGetter {
 	if getter, ok := f.cache[region]; ok {
 		return getter
@@ -251,22 +253,22 @@ func (p *ecrTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationTokenI
 	return p.svc.GetAuthorizationToken(input)
 }
 
-/*CACHE*/
 type cacheEntry struct {
 	expiresAt   time.Time
 	credentials credentialprovider.DockerConfigEntry
 	registry    string
 }
 
-// ecrExpirationPolicy implements ExpirationPolicy.
+// ecrExpirationPolicy implements ExpirationPolicy from client-go.
 type ecrExpirationPolicy struct{}
 
-// stringKeyFunc is a string as cache key function
+// stringKeyFunc returns the cache key as a string
 func stringKeyFunc(obj interface{}) (string, error) {
 	key := obj.(cacheEntry).registry
 	return key, nil
 }
 
+// IsExpired checks if the ECR credentials are past the expiredAt time
 func (p *ecrExpirationPolicy) IsExpired(entry *cache.TimestampedEntry) bool {
 	expiresAt := entry.Obj.(cacheEntry).expiresAt
 	return expiresAt.Before(time.Now()) //TODO clear before expiration
