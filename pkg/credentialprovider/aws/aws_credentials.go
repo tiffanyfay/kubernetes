@@ -18,6 +18,7 @@ package credentials
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -85,23 +86,29 @@ func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerC
 func (p *ecrProvider) Provide(repoToPull string) credentialprovider.DockerConfig {
 	parsed, err := parseRepoURL(repoToPull)
 	if err != nil {
-		klog.Errorf("while parsing repository URL %v", err)
+		klog.Errorf("while parsing ECR repository URL %v", err)
 		return credentialprovider.DockerConfig{}
 	}
 	if cfg, exists := p.getFromCache(parsed); exists {
+		klog.V(3).Infof("Got credentials for ECR repository %v from cache", parsed.registry)
 		return cfg
 	}
-	return p.getFromECR(parsed)
+	cfg, err := p.getFromECR(parsed)
+	if err != nil {
+		klog.Errorf("unable to get credentials from ECR for %s %v", parsed.registry, err)
+	} else {
+		klog.V(3).Infof("Got credentials for ECR repository %s from ECR API", parsed.registry)
+	}
+	return cfg
 }
 
 // getFromCache attempts to get credentials from the cache
 func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.DockerConfig, bool) {
-	klog.V(3).Infof("Checking cache for credentials for %v", parsed.registry)
 	cfg := credentialprovider.DockerConfig{}
 
 	obj, exists, err := p.cache.GetByKey(parsed.registry)
 	if err != nil {
-		klog.V(3).Infof("unable to get credentials from cache for %v %v", parsed.registry, err)
+		klog.V(6).Infof("unable to get credentials from cache for %s %v", parsed.registry, err)
 		return cfg, exists
 	}
 	if exists {
@@ -112,41 +119,34 @@ func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.Docker
 }
 
 // getFromECR gets credentials from ECR since they are not in the cache
-func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerConfig {
-	klog.V(3).Infof("Getting credentials from ECR for %v", parsed.registry)
+func (p *ecrProvider) getFromECR(parsed *parsedURL) (credentialprovider.DockerConfig, error) {
 	cfg := credentialprovider.DockerConfig{}
 	getter, err := p.getterFactory.GetTokenGetterForRegion(parsed.region)
 	if err != nil {
-		return cfg
+		return cfg, err
 	}
 	params := &ecr.GetAuthorizationTokenInput{RegistryIds: []*string{aws.String(parsed.registryID)}}
 	output, err := getter.GetAuthorizationToken(params)
 	if err != nil {
-		klog.Errorf("while requesting ECR authorization token %v", err)
-		return cfg
+		return cfg, err
 	}
 	if output == nil {
-		klog.Errorf("Got back no ECR token")
-		return cfg
+		return cfg, errors.New("unable to get ECR token")
 	}
 	if len(output.AuthorizationData) == 0 {
-		klog.Errorf("Got back no ECR authorization data")
-		return cfg
+		return cfg, errors.New("unable to get authorization data")
 	}
 	data := output.AuthorizationData[0]
 	if data.AuthorizationToken == nil {
-		klog.Errorf("Got back no authorization token")
-		return cfg
+		return cfg, errors.New("unable to get authorization token")
 	}
 	if data.ProxyEndpoint == nil {
-		klog.Errorf("Got back no proxy endpoint")
-		return cfg
+		return cfg, errors.New("unable to get proxy endpoint")
 	}
 
 	decodedToken, err := base64.StdEncoding.DecodeString(aws.StringValue(data.AuthorizationToken))
 	if err != nil {
-		klog.Errorf("while decoding token for endpoint %v %v", data.ProxyEndpoint, err)
-		return cfg
+		return cfg, err
 	}
 	parts := strings.SplitN(string(decodedToken), ":", 2)
 	user := parts[0]
@@ -163,11 +163,10 @@ func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerCon
 		registry:    parsed.registry,
 	}
 	if err := p.cache.Add(entry); err != nil {
-		klog.Errorf("while adding entry to cache %v", err)
-		return cfg
+		return cfg, err
 	}
 	cfg[entry.registry] = entry.credentials
-	return cfg
+	return cfg, nil
 }
 
 type parsedURL struct {
