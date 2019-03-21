@@ -45,8 +45,8 @@ type ExpirationCache struct {
 	expirationLock sync.Mutex
 }
 
-// ExpirationPolicy dictates when an object expires. Currently only abstracted out
-// so unittests don't rely on the system clock.
+// ExpirationPolicy dictates when an object expires. This interface also makes
+// it so unittests don't rely on the system clock.
 type ExpirationPolicy interface {
 	IsExpired(obj *TimestampedEntry) bool
 }
@@ -68,6 +68,9 @@ func (p *TTLPolicy) IsExpired(obj *TimestampedEntry) bool {
 }
 
 // TimestampedEntry is the only type allowed in a ExpirationCache.
+// Keep in mind that it is not safe to share timestamps between computers.
+// Behavior may be inconsistent if you get a timestamp from the API Server and
+// use it on the client machine as part of your ExpirationCache.
 type TimestampedEntry struct {
 	Obj       interface{}
 	Timestamp time.Time
@@ -199,12 +202,7 @@ func (c *ExpirationCache) Resync() error {
 
 // NewTTLStore creates and returns a ExpirationCache with a TTLPolicy
 func NewTTLStore(keyFunc KeyFunc, ttl time.Duration) Store {
-	return &ExpirationCache{
-		cacheStorage:     NewThreadSafeStore(Indexers{}, Indices{}),
-		keyFunc:          keyFunc,
-		clock:            clock.RealClock{},
-		expirationPolicy: &TTLPolicy{ttl, clock.RealClock{}},
-	}
+	return NewExpirationStore(keyFunc, &TTLPolicy{ttl, clock.RealClock{}})
 }
 
 // NewExpirationStore creates and returns a ExpirationCache for a given policy

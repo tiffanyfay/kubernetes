@@ -75,7 +75,7 @@ type AuthConfig struct {
 
 // LazyAuthConfiguration wraps dockertypes.AuthConfig, potentially deferring its
 // binding. If Provider is non-nil, it will be used to obtain new credentials
-// by calling LazyProvide(repoToPull) on it.
+// by calling LazyProvide() on it.
 type LazyAuthConfiguration struct {
 	AuthConfig
 	Provider DockerConfigProvider
@@ -181,8 +181,8 @@ func isDefaultRegistryMatch(image string) bool {
 
 // url.Parse require a scheme, but ours don't have schemes.  Adding a
 // scheme to make url.Parse happy, then clear out the resulting scheme.
-func parseSchemelessURL(schemelessURL string) (*url.URL, error) {
-	parsed, err := url.Parse("https://" + schemelessURL)
+func parseSchemelessUrl(schemelessUrl string) (*url.URL, error) {
+	parsed, err := url.Parse("https://" + schemelessUrl)
 	if err != nil {
 		return nil, err
 	}
@@ -191,8 +191,8 @@ func parseSchemelessURL(schemelessURL string) (*url.URL, error) {
 	return parsed, nil
 }
 
-// splitURL splits the host name into parts, as well as the port
-func splitURL(url *url.URL) (parts []string, port string) {
+// split the host name into parts, as well as the port
+func splitUrl(url *url.URL) (parts []string, port string) {
 	host, port, err := net.SplitHostPort(url.Host)
 	if err != nil {
 		// could not parse port
@@ -201,48 +201,45 @@ func splitURL(url *url.URL) (parts []string, port string) {
 	return strings.Split(host, "."), port
 }
 
-// urlsMatchStr is an overloaded version of urlsMatch, operating on strings instead of URLs.
+// overloaded version of urlsMatch, operating on strings instead of URLs.
 func urlsMatchStr(glob string, target string) (bool, error) {
-	globURL, err := parseSchemelessURL(glob)
+	globUrl, err := parseSchemelessUrl(glob)
 	if err != nil {
 		return false, err
 	}
-	targetURL, err := parseSchemelessURL(target)
+	targetUrl, err := parseSchemelessUrl(target)
 	if err != nil {
 		return false, err
 	}
-	return urlsMatch(globURL, targetURL)
+	return urlsMatch(globUrl, targetUrl)
 }
 
 // check whether the given target url matches the glob url, which may have
 // glob wild cards in the host name.
 //
 // Examples:
-//    globURL=*.docker.io, targetURL=blah.docker.io => match
-//    globURL=*.docker.io, targetURL=not.right.io   => no match
+//    globUrl=*.docker.io, targetUrl=blah.docker.io => match
+//    globUrl=*.docker.io, targetUrl=not.right.io   => no match
 //
 // Note that we don't support wildcards in ports and paths yet.
-
-// *.dkr.ecr.*.amazonaws.com, 123.dkr.ecr.us-west-2.amazonaws.com
-// *.dkr.ecr.*.amazonaws.com.cn, 123.dkr.ecr.us-west-2.amazonaws.com.cn -> last blob would be com.cn
-func urlsMatch(globURL *url.URL, targetURL *url.URL) (bool, error) {
-	globURLParts, globPort := splitURL(globURL)
-	targetURLParts, targetPort := splitURL(targetURL)
+func urlsMatch(globUrl *url.URL, targetUrl *url.URL) (bool, error) {
+	globUrlParts, globPort := splitUrl(globUrl)
+	targetUrlParts, targetPort := splitUrl(targetUrl)
 	if globPort != targetPort {
 		// port doesn't match
 		return false, nil
 	}
-	if len(globURLParts) != len(targetURLParts) {
+	if len(globUrlParts) != len(targetUrlParts) {
 		// host name does not have the same number of parts
 		return false, nil
 	}
-	if !strings.HasPrefix(targetURL.Path, globURL.Path) {
+	if !strings.HasPrefix(targetUrl.Path, globUrl.Path) {
 		// the path of the credential must be a prefix
 		return false, nil
 	}
-	for k, globURLPart := range globURLParts {
-		targetURLPart := targetURLParts[k]
-		matched, err := filepath.Match(globURLPart, targetURLPart)
+	for k, globUrlPart := range globUrlParts {
+		targetUrlPart := targetUrlParts[k]
+		matched, err := filepath.Match(globUrlPart, targetUrlPart)
 		if err != nil {
 			return false, err
 		}
