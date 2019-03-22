@@ -47,8 +47,8 @@ type testTokenGetterFactory struct {
 	getter tokenGetter
 }
 
-func (f *testTokenGetterFactory) GetTokenGetterForRegion(region string) tokenGetter {
-	return f.getter
+func (f *testTokenGetterFactory) GetTokenGetterForRegion(region string) (tokenGetter, error) {
+	return f.getter, nil
 }
 
 func (p *testTokenGetter) GetAuthorizationToken(input *ecr.GetAuthorizationTokenInput) (*ecr.GetAuthorizationTokenOutput, error) {
@@ -92,10 +92,10 @@ func TestParseRepoURLPass(t *testing.T) {
 }
 
 func TestParseRepoURLFail(t *testing.T) {
-	registry := "123456789012.amazonaws.com"
+	registry := "123456789012.foo.bar.baz"
 	repoToPull := path.Join(registry, "foo/bar")
 	parsedURL, err := parseRepoURL(repoToPull)
-	expectedErr := "repository URL 123456789012.amazonaws.com improperly formatted"
+	expectedErr := "123456789012.foo.bar.baz is not a valid ECR repository URL"
 
 	if err == nil {
 		t.Errorf("Should fail to parse URL %s", repoToPull)
@@ -117,14 +117,13 @@ func TestECRProvide(t *testing.T) {
 	}
 	image := "foo/bar"
 	repoToPull := path.Join(registry, image)
-	p := newECRProvider(registryURLTemplateStandard,
-		&testTokenGetterFactory{
-			getter: &testTokenGetter{
-				user:     user,
-				password: password,
-				endpoint: registry,
-			},
-		})
+	p := newECRProvider(&testTokenGetterFactory{
+		getter: &testTokenGetter{
+			user:     user,
+			password: password,
+			endpoint: registry,
+		},
+	})
 	keyring := &credentialprovider.BasicDockerKeyring{}
 	keyring.Add(p.Provide(repoToPull))
 
@@ -164,15 +163,14 @@ func TestECRProvideCached(t *testing.T) {
 	registry := "123456789012.dkr.ecr.lala-land-1.amazonaws.com"
 	image1 := "foo/bar"
 	image2 := "bar/baz"
-	p := newECRProvider(registryURLTemplateStandard,
-		&testTokenGetterFactory{
-			getter: &testTokenGetter{
-				user:              user,
-				password:          password,
-				endpoint:          registry,
-				randomizePassword: true,
-			},
-		})
+	p := newECRProvider(&testTokenGetterFactory{
+		getter: &testTokenGetter{
+			user:              user,
+			password:          password,
+			endpoint:          registry,
+			randomizePassword: true,
+		},
+	})
 	repoToPull1 := path.Join(registry, image1)
 	repoToPull2 := path.Join(registry, image2)
 	keyring := &credentialprovider.BasicDockerKeyring{}
@@ -220,14 +218,13 @@ func TestChinaECRProvide(t *testing.T) {
 	}
 	image := "foo/bar"
 	repoToPull := path.Join(registry, image)
-	p := newECRProvider(registryURLTemplateChina,
-		&testTokenGetterFactory{
-			getter: &testTokenGetter{
-				user:     user,
-				password: password,
-				endpoint: registry,
-			},
-		})
+	p := newECRProvider(&testTokenGetterFactory{
+		getter: &testTokenGetter{
+			user:     user,
+			password: password,
+			endpoint: registry,
+		},
+	})
 	keyring := &credentialprovider.BasicDockerKeyring{}
 	keyring.Add(p.Provide(repoToPull))
 	// Verify that we get the expected username/password combo for
@@ -265,15 +262,14 @@ func TestChinaECRProvide(t *testing.T) {
 func TestChinaECRProvideCached(t *testing.T) {
 	registry := "123456789012.dkr.ecr.cn-foo-1.amazonaws.com.cn"
 	image := "foo/bar"
-	p := newECRProvider(registryURLTemplateChina,
-		&testTokenGetterFactory{
-			getter: &testTokenGetter{
-				user:              user,
-				password:          password,
-				endpoint:          registry,
-				randomizePassword: true,
-			},
-		})
+	p := newECRProvider(&testTokenGetterFactory{
+		getter: &testTokenGetter{
+			user:              user,
+			password:          password,
+			endpoint:          registry,
+			randomizePassword: true,
+		},
+	})
 	repoToPull := path.Join(registry, image)
 	keyring := &credentialprovider.BasicDockerKeyring{}
 	keyring.Add(p.Provide(repoToPull))

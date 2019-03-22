@@ -18,6 +18,7 @@ package credentials
 
 import (
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -34,46 +35,48 @@ import (
 	"k8s.io/kubernetes/pkg/version"
 )
 
-const registryURLTemplateStandard = "*.dkr.ecr.*.amazonaws.com"
-const registryURLTemplateChina = "*.dkr.ecr.*.amazonaws.com.cn"
-
 // init registers a credential provider for each registryURLTemplate and creates
 // an ECR token getter factory with a new cache to store token getters
 func init() {
-	credentialprovider.RegisterCredentialProvider("aws-ecr-partition-standard",
-		newECRProvider(registryURLTemplateStandard,
-			&ecrTokenGetterFactory{cache: make(map[string]tokenGetter)}))
-
-	credentialprovider.RegisterCredentialProvider("aws-ecr-partition-china",
-		newECRProvider(registryURLTemplateChina,
-			&ecrTokenGetterFactory{cache: make(map[string]tokenGetter)}))
+	credentialprovider.RegisterCredentialProvider("amazon-ecr",
+		newECRProvider(&ecrTokenGetterFactory{cache: make(map[string]tokenGetter)}))
 }
 
 // ecrProvider is a DockerConfigProvider that gets and refreshes tokens
 // from AWS to access ECR.
 type ecrProvider struct {
-	registryURLTemplate string
-	cache               cache.Store
-	getterFactory       tokenGetterFactory
+	cache         cache.Store
+	getterFactory tokenGetterFactory
 }
 
 var _ credentialprovider.DockerConfigProvider = &ecrProvider{}
 
-func newECRProvider(template string, getterFactory tokenGetterFactory) *ecrProvider {
+func newECRProvider(getterFactory tokenGetterFactory) *ecrProvider {
 	return &ecrProvider{
-		registryURLTemplate: template,
-		cache:               cache.NewExpirationStore(stringKeyFunc, &ecrExpirationPolicy{}),
-		getterFactory:       getterFactory,
+		cache:         cache.NewExpirationStore(stringKeyFunc, &ecrExpirationPolicy{}),
+		getterFactory: getterFactory,
 	}
 }
 
-// Enabled implements DockerConfigProvider.Enabled
+// Enabled implements DockerConfigProvider.Enabled. Enabled is true if AWS
+// credentials are found.
 func (p *ecrProvider) Enabled() bool {
+	sess, err := session.NewSessionWithOptions(session.Options{
+		SharedConfigState: session.SharedConfigEnable,
+	})
+	if err != nil {
+		klog.Errorf("while validating AWS credentials %v", err)
+		return false
+	}
+	if _, err := sess.Config.Credentials.Get(); err != nil {
+		klog.Errorf("while getting AWS credentials %v", err)
+		return false
+	}
 	return true
 }
 
 // LazyProvide is lazy
-// TODO: LazyProvide will be removed shortly
+// TODO: PR to remove LazyProvide
 func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerConfigEntry {
 	return nil
 }
@@ -83,22 +86,29 @@ func (p *ecrProvider) LazyProvide(repoToPull string) *credentialprovider.DockerC
 func (p *ecrProvider) Provide(repoToPull string) credentialprovider.DockerConfig {
 	parsed, err := parseRepoURL(repoToPull)
 	if err != nil {
+		klog.Errorf("while parsing ECR repository URL %v", err)
 		return credentialprovider.DockerConfig{}
 	}
 	if cfg, exists := p.getFromCache(parsed); exists {
+		klog.V(3).Infof("Got ECR credentials from cache for %s", parsed.registry)
 		return cfg
 	}
-	return p.getFromECR(parsed)
+	cfg, err := p.getFromECR(parsed)
+	if err != nil {
+		klog.Errorf("unable to get credentials from ECR for %s %v", parsed.registry, err)
+	} else {
+		klog.V(3).Infof("Got ECR credentials from ECR API for %s", parsed.registry)
+	}
+	return cfg
 }
 
 // getFromCache attempts to get credentials from the cache
 func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.DockerConfig, bool) {
-	klog.Infof("Checking cache for credentials for %v", parsed.registry)
 	cfg := credentialprovider.DockerConfig{}
 
 	obj, exists, err := p.cache.GetByKey(parsed.registry)
 	if err != nil {
-		klog.Warningf("unable to get credentials from cache for %v %v", parsed.registry, err)
+		klog.V(6).Infof("unable to get credentials from cache for %s %v", parsed.registry, err)
 		return cfg, exists
 	}
 	if exists {
@@ -109,39 +119,34 @@ func (p *ecrProvider) getFromCache(parsed *parsedURL) (credentialprovider.Docker
 }
 
 // getFromECR gets credentials from ECR since they are not in the cache
-func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerConfig {
-	klog.Infof("Getting credentials from ECR for %v", parsed.registry)
+func (p *ecrProvider) getFromECR(parsed *parsedURL) (credentialprovider.DockerConfig, error) {
 	cfg := credentialprovider.DockerConfig{}
-	getter := p.getterFactory.GetTokenGetterForRegion(parsed.region)
-
+	getter, err := p.getterFactory.GetTokenGetterForRegion(parsed.region)
+	if err != nil {
+		return cfg, err
+	}
 	params := &ecr.GetAuthorizationTokenInput{RegistryIds: []*string{aws.String(parsed.registryID)}}
 	output, err := getter.GetAuthorizationToken(params)
 	if err != nil {
-		klog.Errorf("while requesting ECR authorization token %v", err)
-		return cfg
+		return cfg, err
 	}
 	if output == nil {
-		klog.Errorf("Got back no ECR token")
-		return cfg
+		return cfg, errors.New("unable to get ECR token")
 	}
 	if len(output.AuthorizationData) == 0 {
-		klog.Errorf("Got back no ECR authorization data")
-		return cfg
+		return cfg, errors.New("unable to get authorization data")
 	}
 	data := output.AuthorizationData[0]
 	if data.AuthorizationToken == nil {
-		klog.Errorf("Got back no authorization token")
-		return cfg
+		return cfg, errors.New("unable to get authorization token")
 	}
 	if data.ProxyEndpoint == nil {
-		klog.Errorf("Got back no proxy endpoint")
-		return cfg
+		return cfg, errors.New("unable to get proxy endpoint")
 	}
 
 	decodedToken, err := base64.StdEncoding.DecodeString(aws.StringValue(data.AuthorizationToken))
 	if err != nil {
-		klog.Errorf("while decoding token for endpoint %v %v", data.ProxyEndpoint, err)
-		return cfg
+		return cfg, err
 	}
 	parts := strings.SplitN(string(decodedToken), ":", 2)
 	user := parts[0]
@@ -158,11 +163,10 @@ func (p *ecrProvider) getFromECR(parsed *parsedURL) credentialprovider.DockerCon
 		registry:    parsed.registry,
 	}
 	if err := p.cache.Add(entry); err != nil {
-		klog.Errorf("while adding entry to cache %v", err)
-		return cfg
+		return cfg, err
 	}
 	cfg[entry.registry] = entry.credentials
-	return cfg
+	return cfg, nil
 }
 
 type parsedURL struct {
@@ -173,6 +177,8 @@ type parsedURL struct {
 
 // parseRepoURL parses and splits the registry URL into the registry ID,
 // region, and registry.
+// <registryID>.dkr.ecr.<region>.amazonaws.com
+// <registryID>.dkr.ecr.<region>.amazonaws.com.cn
 func parseRepoURL(repoToPull string) (*parsedURL, error) {
 	parsed, err := url.Parse("https://" + repoToPull)
 	if err != nil {
@@ -180,8 +186,8 @@ func parseRepoURL(repoToPull string) (*parsedURL, error) {
 		return nil, err
 	}
 	splitURL := strings.Split(parsed.Host, ".")
-	if len(splitURL) < 4 {
-		return nil, fmt.Errorf("repository URL %s improperly formatted", parsed.Host)
+	if len(splitURL) < 4 || splitURL[2] != "ecr" || splitURL[4] != "amazonaws" {
+		return nil, fmt.Errorf("%s is not a valid ECR repository URL", parsed.Host)
 	}
 	return &parsedURL{
 		registryID: splitURL[0],
@@ -197,7 +203,7 @@ type tokenGetter interface {
 
 // tokenGetterFactory is for testing purposes
 type tokenGetterFactory interface {
-	GetTokenGetterForRegion(string) tokenGetter
+	GetTokenGetterForRegion(string) (tokenGetter, error)
 }
 
 // ecrTokenGetterFactory stores a token getter per region
@@ -219,10 +225,12 @@ func awsHandlerLogger(req *request.Request) {
 	klog.V(3).Infof("AWS request: %s:%s in %s", service, name, *region)
 }
 
-func newECRTokenGetter(region string) tokenGetter {
-	getter := &ecrTokenGetter{svc: ecr.New(session.New(&aws.Config{
-		Region: aws.String(region),
-	}))}
+func newECRTokenGetter(region string) (tokenGetter, error) {
+	sess, err := session.NewSession(&aws.Config{Region: aws.String(region)})
+	if err != nil {
+		return nil, err
+	}
+	getter := &ecrTokenGetter{svc: ecr.New(sess)}
 	getter.svc.Handlers.Build.PushFrontNamed(request.NamedHandler{
 		Name: "k8s/user-agent",
 		Fn:   request.MakeAddToUserAgentHandler("kubernetes", version.Get().String()),
@@ -231,17 +239,22 @@ func newECRTokenGetter(region string) tokenGetter {
 		Name: "k8s/logger",
 		Fn:   awsHandlerLogger,
 	})
-	return getter
+	return getter, nil
 }
 
 // GetTokenGetterForRegion gets the token getter for the requested region. If it
 // doesn't exist, it creates a new ECR token getter
-func (f *ecrTokenGetterFactory) GetTokenGetterForRegion(region string) tokenGetter {
+func (f *ecrTokenGetterFactory) GetTokenGetterForRegion(region string) (tokenGetter, error) {
 	if getter, ok := f.cache[region]; ok {
-		return getter
+		return getter, nil
 	}
-	f.cache[region] = newECRTokenGetter(region)
-	return f.cache[region]
+	getter, err := newECRTokenGetter(region)
+	if err != nil {
+		klog.Errorf("while getting creating token getter for region %v %v", region, err)
+		return nil, err
+	}
+	f.cache[region] = getter
+	return f.cache[region], nil
 }
 
 // The canonical implementation
@@ -269,8 +282,11 @@ func stringKeyFunc(obj interface{}) (string, error) {
 	return key, nil
 }
 
-// IsExpired checks if the ECR credentials are past the expiredAt time
+// IsExpired checks if the ECR credentials are expired. Credentials expire at
+// 1/2 of their original requested window.
 func (p *ecrExpirationPolicy) IsExpired(entry *cache.TimestampedEntry) bool {
-	expiresAt := entry.Obj.(*cacheEntry).expiresAt
-	return expiresAt.Before(time.Now()) //TODO clear before expiration
+	ecrExpiresAt := entry.Obj.(*cacheEntry).expiresAt
+	validWindow := ecrExpiresAt.Sub(entry.Timestamp)
+	expirationTime := ecrExpiresAt.Add(-1 * validWindow / time.Duration(2))
+	return expirationTime.Before(time.Now())
 }

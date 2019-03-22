@@ -68,6 +68,9 @@ func (p *TTLPolicy) IsExpired(obj *TimestampedEntry) bool {
 }
 
 // TimestampedEntry is the only type allowed in a ExpirationCache.
+// Keep in mind that it is not safe to share timestamps between computers.
+// Behavior may be inconsistent if you get a timestamp from the API Server and
+// use it on the client machine as part of your ExpirationCache.
 type TimestampedEntry struct {
 	Obj       interface{}
 	Timestamp time.Time
